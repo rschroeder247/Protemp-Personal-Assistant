@@ -1,12 +1,5 @@
-import { PublicClientApplication } from '@azure/msal-browser';
-import type { AccountInfo, AuthenticationResult } from '@azure/msal-browser';
 import { Client } from '@microsoft/microsoft-graph-client';
-import {
-  createMsalConfig,
-  getStoredClientId,
-  getStoredTenantId,
-  GRAPH_SCOPES,
-} from './msalConfig';
+import { getStoredClientId, getStoredTenantId } from './msalConfig';
 import {
   AssistantAction,
   Contact,
@@ -15,58 +8,48 @@ import {
   TodoList,
 } from './types';
 
-const TOKEN_BACKUP_KEY = 'pa_ms_token_backup';
+export interface M365AccountProfile {
+  id?: string;
+  name: string;
+  username: string;
+}
+
+export interface DeviceCodeSession {
+  userCode: string;
+  deviceCode: string;
+  verificationUri: string;
+  expiresIn: number;
+  interval: number;
+  message: string;
+}
 
 class GraphService {
-  private currentAccount: AccountInfo | null = null;
+  private currentAccount: M365AccountProfile | null = null;
   private cachedAccessToken: string | null = null;
   private tokenExpiresAt = 0;
-  private tokenPromise: Promise<string> | null = null;
-  private initPromise: Promise<PublicClientApplication | null> | null = null;
-  public lastAuthError: string | null = null;
 
-  private saveTokenResult(result: AuthenticationResult | null): void {
-    if (!result?.accessToken) return;
-    this.cachedAccessToken = result.accessToken;
-    const expiresMs = result.expiresOn
-      ? result.expiresOn.getTime()
-      : Date.now() + 3500 * 1000;
-    this.tokenExpiresAt = expiresMs;
-    try {
-      sessionStorage.setItem(
-        TOKEN_BACKUP_KEY,
-        JSON.stringify({
-          accessToken: result.accessToken,
-          expiresAt: expiresMs,
-          username: result.account?.username || '',
-        })
-      );
-    } catch {
-      // ignore
+  public async getAccount(): Promise<M365AccountProfile | null> {
+    if (
+      this.currentAccount &&
+      this.cachedAccessToken &&
+      this.tokenExpiresAt > Date.now() + 60000
+    ) {
+      return this.currentAccount;
     }
-  }
 
-  private getValidCachedToken(username?: string): string | null {
-    const now = Date.now() + 60 * 1000;
-    if (this.cachedAccessToken && this.tokenExpiresAt > now) {
-      return this.cachedAccessToken;
-    }
-    if (typeof window === 'undefined') return null;
     try {
-      const raw = sessionStorage.getItem(TOKEN_BACKUP_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (
-          parsed.accessToken &&
-          parsed.expiresAt > now &&
-          (!username ||
-            !parsed.username ||
-            parsed.username.toLowerCase() === username.toLowerCase())
-        ) {
-          this.cachedAccessToken = parsed.accessToken;
-          this.tokenExpiresAt = parsed.expiresAt;
-          return parsed.accessToken;
-        }
+      const res = await fetch('/api/m365/auth', { cache: 'no-store' });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.connected && data.accessToken) {
+        this.cachedAccessToken = data.accessToken;
+        this.tokenExpiresAt = data.expiresAt || Date.now() + 3000 * 1000;
+        this.currentAccount = {
+          id: data.user?.id,
+          name: data.user?.name || 'Microsoft 365 User',
+          username: data.user?.email || '',
+        };
+        return this.currentAccount;
       }
     } catch {
       // ignore
@@ -74,175 +57,103 @@ class GraphService {
     return null;
   }
 
-  public cleanupStaleState(): void {
-    if (typeof window === 'undefined') return;
-    try {
-      const hash = window.location.hash;
-      const search = window.location.search;
-      if (
-        hash.includes('code=') ||
-        hash.includes('state=') ||
-        hash.includes('error=') ||
-        search.includes('code=') ||
-        search.includes('state=') ||
-        search.includes('error=')
-      ) {
-        window.history.replaceState({}, document.title, window.location.pathname);
-      }
-
-      for (let i = sessionStorage.length - 1; i >= 0; i--) {
-        const key = sessionStorage.key(i);
-        if (key && key.includes('interaction.status')) {
-          sessionStorage.removeItem(key);
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  public getMsal(): Promise<PublicClientApplication | null> {
-    if (typeof window === 'undefined') return Promise.resolve(null);
-    const clientId = getStoredClientId();
-    if (!clientId) return Promise.resolve(null);
-
-    if (!this.initPromise) {
-      this.initPromise = (async () => {
-        const config = createMsalConfig(clientId, getStoredTenantId());
-        const instance = new PublicClientApplication(config);
-        await instance.initialize();
-
-        try {
-          const redirectResponse = await instance.handleRedirectPromise();
-          if (redirectResponse) {
-            this.saveTokenResult(redirectResponse);
-            if (redirectResponse.account) {
-              instance.setActiveAccount(redirectResponse.account);
-              this.currentAccount = redirectResponse.account;
-            }
-          }
-        } catch (redirectErr: any) {
-          const isCacheMiss =
-            redirectErr?.errorCode === 'no_token_request_cache_error' ||
-            redirectErr?.message?.includes('no_token_request_cache_error');
-          if (!isCacheMiss) {
-            console.warn('MSAL redirect notice:', redirectErr);
-            this.lastAuthError = redirectErr?.message || String(redirectErr);
-          }
-        } finally {
-          this.cleanupStaleState();
-        }
-
-        const accounts = instance.getAllAccounts();
-        if (accounts.length > 0 && !this.currentAccount) {
-          this.currentAccount = accounts[0];
-          instance.setActiveAccount(accounts[0]);
-        }
-
-        return instance;
-      })();
-    }
-    return this.initPromise;
-  }
-
-  public async resetMsal(): Promise<void> {
-    this.cleanupStaleState();
-    this.initPromise = null;
-    this.currentAccount = null;
-    this.cachedAccessToken = null;
-    this.tokenExpiresAt = 0;
-    try {
-      sessionStorage.removeItem(TOKEN_BACKUP_KEY);
-    } catch {
-      // ignore
-    }
-  }
-
-  public async getAccount(): Promise<AccountInfo | null> {
-    const msal = await this.getMsal();
-    if (!msal) return null;
-    if (this.currentAccount) return this.currentAccount;
-    const accounts = msal.getAllAccounts();
-    return accounts.length > 0 ? accounts[0] : null;
-  }
-
-  public async login(): Promise<void> {
-    this.cleanupStaleState();
-    const msal = await this.getMsal();
-    if (!msal) {
-      throw new Error('Azure Client ID is not configured.');
-    }
-    await msal.loginRedirect({
-      scopes: GRAPH_SCOPES,
-      prompt: 'select_account',
+  public async startDeviceCodeLogin(): Promise<DeviceCodeSession> {
+    const res = await fetch('/api/m365/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'start_device_code',
+        clientId: getStoredClientId(),
+        tenantId: getStoredTenantId(),
+      }),
     });
+
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      throw new Error(data.error || 'Could not start Microsoft 365 sign-in');
+    }
+    return data as DeviceCodeSession;
+  }
+
+  public async pollDeviceCodeLogin(deviceCode: string): Promise<{
+    status: 'pending' | 'connected' | 'error';
+    account?: M365AccountProfile;
+    error?: string;
+  }> {
+    const res = await fetch('/api/m365/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'poll_device_code',
+        deviceCode,
+        clientId: getStoredClientId(),
+        tenantId: getStoredTenantId(),
+      }),
+    });
+
+    const data = await res.json();
+    if (data.status === 'pending') {
+      return { status: 'pending' };
+    }
+    if (!res.ok || data.status === 'error') {
+      return {
+        status: 'error',
+        error: data.error || 'Sign-in expired or failed',
+      };
+    }
+
+    this.cachedAccessToken = data.accessToken;
+    this.tokenExpiresAt = data.expiresAt || Date.now() + 3500 * 1000;
+    this.currentAccount = {
+      id: data.user?.id,
+      name: data.user?.name || 'Microsoft 365 User',
+      username: data.user?.email || '',
+    };
+
+    return {
+      status: 'connected',
+      account: this.currentAccount,
+    };
   }
 
   public async logout(): Promise<void> {
-    const msal = await this.getMsal();
-    if (!msal) return;
-    const account = await this.getAccount();
     this.currentAccount = null;
     this.cachedAccessToken = null;
     this.tokenExpiresAt = 0;
-    try {
-      sessionStorage.removeItem(TOKEN_BACKUP_KEY);
-    } catch {
-      // ignore
-    }
-    this.cleanupStaleState();
-    if (account) {
-      await msal.logoutRedirect({ account });
-    }
+    await fetch('/api/m365/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'logout' }),
+    });
   }
 
-  public async getAccessToken(extraScopes: string[] = []): Promise<string> {
-    const msal = await this.getMsal();
-    if (!msal) throw new Error('MSAL not initialized');
-
-    const account = this.currentAccount || (await this.getAccount());
-    if (!account) {
-      throw new Error('Not signed in to Microsoft 365. Click "Connect Microsoft 365" in the header.');
+  public async getAccessToken(): Promise<string> {
+    const now = Date.now() + 60 * 1000;
+    if (this.cachedAccessToken && this.tokenExpiresAt > now) {
+      return this.cachedAccessToken;
     }
 
-    if (extraScopes.length === 0) {
-      const validToken = this.getValidCachedToken(account.username);
-      if (validToken) return validToken;
+    const res = await fetch('/api/m365/auth', { cache: 'no-store' });
+    const data = await res.json();
+    if (!res.ok || !data.connected || !data.accessToken) {
+      throw new Error(
+        'Not connected to Microsoft 365 yet. Click "Connect Microsoft 365" in the top right header.'
+      );
     }
 
-    const scopesToRequest = Array.from(new Set([...GRAPH_SCOPES, ...extraScopes]));
+    this.cachedAccessToken = data.accessToken;
+    this.tokenExpiresAt = data.expiresAt || Date.now() + 3500 * 1000;
+    this.currentAccount = {
+      id: data.user?.id,
+      name: data.user?.name || 'Microsoft 365 User',
+      username: data.user?.email || '',
+    };
 
-    if (!this.tokenPromise) {
-      this.tokenPromise = (async () => {
-        try {
-          const response = await msal.acquireTokenSilent({
-            scopes: scopesToRequest,
-            account,
-          });
-          this.saveTokenResult(response);
-          return response.accessToken;
-        } catch (silentErr: any) {
-          // If extraScopes caused consent failure, fallback to base GRAPH_SCOPES
-          if (extraScopes.length > 0) {
-            const fallbackResponse = await msal.acquireTokenSilent({
-              scopes: GRAPH_SCOPES,
-              account,
-            });
-            this.saveTokenResult(fallbackResponse);
-            return fallbackResponse.accessToken;
-          }
-          throw silentErr;
-        } finally {
-          this.tokenPromise = null;
-        }
-      })();
-    }
-
-    return this.tokenPromise;
+    return data.accessToken;
   }
 
-  public async getGraphClient(extraScopes: string[] = []): Promise<Client> {
-    const token = await this.getAccessToken(extraScopes);
+  public async getGraphClient(): Promise<Client> {
+    const token = await this.getAccessToken();
     return Client.init({
       authProvider: (done) => {
         done(null, token);
@@ -365,7 +276,7 @@ class GraphService {
         plansMap.set(p.id, { id: p.id, title: p.title, owner: p.owner });
       }
     } catch {
-      // May require Group.Read.All in some tenants; fallback to Strategy B
+      // Fallback to Strategy B
     }
 
     // Strategy B: Discover plans from user's existing Planner tasks (/me/planner/tasks only requires Tasks.ReadWrite!)
@@ -431,7 +342,6 @@ class GraphService {
     let planId = action.plan_id || fallbackPlanId;
     let bucketId = action.bucket_id || fallbackBucketId;
 
-    // Auto-discover first available plan if none specified
     if (!planId) {
       const plans = await this.getPlannerPlans();
       if (plans.length > 0) {
@@ -445,7 +355,6 @@ class GraphService {
       );
     }
 
-    // Auto-discover first bucket in the plan if none specified
     if (!bucketId) {
       const buckets = await this.getPlannerBuckets(planId);
       if (buckets.length > 0) {
@@ -474,7 +383,6 @@ class GraphService {
       payload.dueDateTime = `${action.due_date.split('T')[0]}T17:00:00Z`;
     }
 
-    // Assign to current signed-in user by default so it shows up in "My Tasks"
     try {
       const me = await client.api('/me').select('id').get();
       if (me?.id) {
@@ -486,12 +394,11 @@ class GraphService {
         };
       }
     } catch {
-      // ignore assignment if /me fails
+      // ignore
     }
 
     const created = await client.api('/planner/tasks').post(payload);
 
-    // If description/notes exist, attach them to /planner/tasks/{id}/details
     if (action.description && created?.id) {
       try {
         const details = await client
@@ -548,14 +455,14 @@ class GraphService {
     const recipientEmail = action.recipient_email?.trim();
     if (!recipientEmail && mode === 'send_immediately') {
       throw new Error(
-        `Recipient email is missing for "${action.recipient_name || action.title}". Please add their email on the card or in Contacts.`
+        `Recipient email is missing for "${
+          action.recipient_name || action.title
+        }". Please add their email on the card or in Contacts.`
       );
     }
 
     try {
-      const client = await this.getGraphClient(
-        mode === 'send_immediately' ? ['Mail.Send'] : ['Mail.ReadWrite']
-      );
+      const client = await this.getGraphClient();
 
       const messagePayload: any = {
         subject: action.title,
@@ -597,8 +504,7 @@ class GraphService {
           method: 'graph_draft',
         };
       }
-    } catch (err: any) {
-      // If Mail.Send isn't consented on the Azure App Registration yet, open Outlook Web Compose pre-filled!
+    } catch {
       const composeUrl = `https://outlook.office.com/mail/deeplink/compose?to=${encodeURIComponent(
         recipientEmail || ''
       )}&subject=${encodeURIComponent(action.title)}&body=${encodeURIComponent(
@@ -632,7 +538,8 @@ class GraphService {
     const startTimeStr = action.start_time || '09:00';
     const [startH, startM] = startTimeStr.split(':').map(Number);
     const endH = String(Math.min((startH || 9) + 1, 23)).padStart(2, '0');
-    const endTimeStr = action.end_time || `${endH}:${String(startM || 0).padStart(2, '0')}`;
+    const endTimeStr =
+      action.end_time || `${endH}:${String(startM || 0).padStart(2, '0')}`;
 
     const startLocal = new Date(`${baseDate}T${startTimeStr}:00`);
     const endLocal = new Date(`${baseDate}T${endTimeStr}:00`);
@@ -641,7 +548,9 @@ class GraphService {
       subject: action.title,
       body: {
         contentType: 'HTML',
-        content: `<p>${action.description || 'Scheduled via Personal Voice Assistant'}</p>`,
+        content: `<p>${
+          action.description || 'Scheduled via Personal Voice Assistant'
+        }</p>`,
       },
       start: {
         dateTime: startLocal.toISOString().replace(/Z$/, ''),
@@ -700,7 +609,7 @@ class GraphService {
         }
       }
     } catch {
-      // ignore if People.Read is not consented
+      // ignore
     }
 
     return contacts;

@@ -33,6 +33,7 @@ import VoiceRecorderCard from './VoiceRecorderCard';
 import ActionCard from './ActionCard';
 import ContactsModal from './ContactsModal';
 import SettingsModal from './SettingsModal';
+import M365ConnectModal from './M365ConnectModal';
 import {
   Sparkles,
   Users,
@@ -84,6 +85,7 @@ export default function AssistantClient() {
   const [executingIds, setExecutingIds] = useState<Record<string, boolean>>({});
   const [isContactsOpen, setIsContactsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isM365ModalOpen, setIsM365ModalOpen] = useState(false);
   const [toast, setToast] = useState<{
     type: 'success' | 'error' | 'info';
     text: string;
@@ -504,7 +506,11 @@ export default function AssistantClient() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => graphService.logout()}
+                  onClick={async () => {
+                    await graphService.logout();
+                    setM365User(null);
+                    showToast('Signed out of Microsoft 365', 'info');
+                  }}
                   className="ml-1 rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-rose-300"
                   title="Sign out of Microsoft 365"
                 >
@@ -514,13 +520,7 @@ export default function AssistantClient() {
             ) : (
               <button
                 type="button"
-                onClick={async () => {
-                  try {
-                    await graphService.login();
-                  } catch (err: any) {
-                    showToast(err?.message || 'Microsoft 365 sign-in failed', 'error');
-                  }
-                }}
+                onClick={() => setIsM365ModalOpen(true)}
                 className="inline-flex items-center gap-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition"
               >
                 <LogIn className="h-4 w-4" />
@@ -765,7 +765,7 @@ export default function AssistantClient() {
                 </p>
                 <button
                   type="button"
-                  onClick={() => graphService.login()}
+                  onClick={() => setIsM365ModalOpen(true)}
                   className="inline-flex items-center gap-2 rounded-xl bg-sky-600 hover:bg-sky-500 px-5 py-2.5 text-xs font-semibold text-white shadow-lg"
                 >
                   <LogIn className="h-4 w-4" /> Connect Microsoft 365
@@ -1062,6 +1062,23 @@ export default function AssistantClient() {
         todoLists={todoLists}
         bucketsByPlan={bucketsByPlan}
         onLoadBuckets={handleLoadBuckets}
+      />
+
+      {/* Microsoft 365 Zero-Redirect Device Code Connect Modal */}
+      <M365ConnectModal
+        isOpen={isM365ModalOpen}
+        onClose={() => setIsM365ModalOpen(false)}
+        onConnected={(account) => {
+          setM365User({
+            name: account.name,
+            email: account.username,
+          });
+          loadM365Metadata();
+          showToast(
+            `Connected to Microsoft 365 as ${account.name}!`,
+            'success'
+          );
+        }}
       />
     </div>
   );
