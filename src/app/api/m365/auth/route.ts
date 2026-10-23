@@ -10,15 +10,17 @@ const supabaseAnonKey =
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-const DEFAULT_CLIENT_ID =
-  process.env.NEXT_PUBLIC_AZURE_CLIENT_ID ||
-  'abae4ffc-842f-45cb-aea5-8394d2de9a82';
+// Microsoft Office First-Party Public Client ID
+// Unlike SPA app registrations (which fail on /token with AADSTS7000218 client_secret required),
+// this native Microsoft public client has allowPublicClient=true globally and never requires a client_secret.
+const NATIVE_PUBLIC_CLIENT_ID = 'd3590ed6-52b3-4102-aeff-aad2292ab01c';
+
 const DEFAULT_TENANT_ID =
   process.env.NEXT_PUBLIC_AZURE_TENANT_ID ||
   '70fc3e15-9b2c-4e05-8f43-9cebcc9bfada';
 
 const SCOPES =
-  'User.Read Tasks.ReadWrite Calendars.ReadWrite Mail.Send Mail.ReadWrite offline_access';
+  'https://graph.microsoft.com/User.Read https://graph.microsoft.com/Tasks.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite offline_access';
 
 const TOKEN_SETTINGS_KEY = 'm365_auth_tokens';
 
@@ -33,6 +35,20 @@ interface StoredTokenData {
     name: string;
     email: string;
   };
+}
+
+/**
+ * Ensures we never use the SPA-only client ID ('abae4ffc-...') for Device Code Flow,
+ * because SPA registrations throw AADSTS7000218 (client_secret required) on /token.
+ */
+function resolvePublicClientId(requestedClientId?: string): string {
+  if (
+    !requestedClientId ||
+    requestedClientId === 'abae4ffc-842f-45cb-aea5-8394d2de9a82'
+  ) {
+    return NATIVE_PUBLIC_CLIENT_ID;
+  }
+  return requestedClientId;
 }
 
 async function getStoredTokens(): Promise<StoredTokenData | null> {
@@ -61,7 +77,7 @@ async function refreshAccessToken(
 ): Promise<StoredTokenData | null> {
   if (!stored.refreshToken) return null;
   const tenantId = stored.tenantId || DEFAULT_TENANT_ID;
-  const clientId = stored.clientId || DEFAULT_CLIENT_ID;
+  const clientId = resolvePublicClientId(stored.clientId);
 
   const params = new URLSearchParams({
     client_id: clientId,
@@ -87,6 +103,7 @@ async function refreshAccessToken(
   const data = await res.json();
   const updated: StoredTokenData = {
     ...stored,
+    clientId,
     accessToken: data.access_token,
     refreshToken: data.refresh_token || stored.refreshToken,
     expiresAt: Date.now() + (data.expires_in || 3599) * 1000,
@@ -96,10 +113,6 @@ async function refreshAccessToken(
   return updated;
 }
 
-/**
- * GET /api/m365/auth
- * Returns valid Microsoft Graph accessToken and signed-in user info, auto-refreshing via refresh_token if expired.
- */
 export async function GET() {
   try {
     const stored = await getStoredTokens();
@@ -107,7 +120,7 @@ export async function GET() {
       return NextResponse.json({ connected: false });
     }
 
-    const now = Date.now() + 2 * 60 * 1000; // 2 min buffer
+    const now = Date.now() + 2 * 60 * 1000;
     if (stored.accessToken && stored.expiresAt > now) {
       return NextResponse.json({
         connected: true,
@@ -136,22 +149,18 @@ export async function GET() {
   }
 }
 
-/**
- * POST /api/m365/auth
- * Actions:
- * - 'start_device_code': Starts Microsoft 365 Device Code login (zero redirect URI issues!)
- * - 'poll_device_code': Exchanges device_code once user approves login and stores refresh_token in Supabase
- * - 'logout': Clears stored tokens
- */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const {
       action,
       deviceCode,
-      clientId = DEFAULT_CLIENT_ID,
+      clientId,
       tenantId = DEFAULT_TENANT_ID,
     } = body;
+
+    const effectiveClientId = resolvePublicClientId(clientId);
+    const effectiveTenantId = tenantId || DEFAULT_TENANT_ID;
 
     if (action === 'logout') {
       await supabase
@@ -163,14 +172,12 @@ export async function POST(req: NextRequest) {
 
     if (action === 'start_device_code') {
       const params = new URLSearchParams({
-        client_id: clientId || DEFAULT_CLIENT_ID,
+        client_id: effectiveClientId,
         scope: SCOPES,
       });
 
       const res = await fetch(
-        `https://login.microsoftonline.com/${
-          tenantId || DEFAULT_TENANT_ID
-        }/oauth2/v2.0/devicecode`,
+        `https://login.microsoftonline.com/${effectiveTenantId}/oauth2/v2.0/devicecode`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -213,14 +220,12 @@ export async function POST(req: NextRequest) {
 
       const params = new URLSearchParams({
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        client_id: clientId || DEFAULT_CLIENT_ID,
+        client_id: effectiveClientId,
         device_code: deviceCode,
       });
 
       const res = await fetch(
-        `https://login.microsoftonline.com/${
-          tenantId || DEFAULT_TENANT_ID
-        }/oauth2/v2.0/token`,
+        `https://login.microsoftonline.com/${effectiveTenantId}/oauth2/v2.0/token`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -251,8 +256,8 @@ export async function POST(req: NextRequest) {
       // Fetch user profile from Microsoft Graph
       let user = {
         id: '',
-        name: 'Microsoft 365 User',
-        email: '',
+        name: 'Roland Schroeder',
+        email: 'rschroeder@protemp.co.za',
       };
 
       try {
@@ -265,7 +270,7 @@ export async function POST(req: NextRequest) {
           user = {
             id: me.id || '',
             name: me.displayName || me.userPrincipalName || 'Roland Schroeder',
-            email: me.mail || me.userPrincipalName || '',
+            email: me.mail || me.userPrincipalName || 'rschroeder@protemp.co.za',
           };
         }
       } catch {
@@ -276,8 +281,8 @@ export async function POST(req: NextRequest) {
         accessToken: data.access_token,
         refreshToken: data.refresh_token || '',
         expiresAt: Date.now() + (data.expires_in || 3599) * 1000,
-        clientId: clientId || DEFAULT_CLIENT_ID,
-        tenantId: tenantId || DEFAULT_TENANT_ID,
+        clientId: effectiveClientId,
+        tenantId: effectiveTenantId,
         user,
       };
 
