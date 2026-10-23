@@ -1,5 +1,4 @@
 import { Client } from '@microsoft/microsoft-graph-client';
-import { getStoredClientId, getStoredTenantId } from './msalConfig';
 import {
   AssistantAction,
   Contact,
@@ -12,15 +11,6 @@ export interface M365AccountProfile {
   id?: string;
   name: string;
   username: string;
-}
-
-export interface DeviceCodeSession {
-  userCode: string;
-  deviceCode: string;
-  verificationUri: string;
-  expiresIn: number;
-  interval: number;
-  message: string;
 }
 
 class GraphService {
@@ -46,8 +36,8 @@ class GraphService {
         this.tokenExpiresAt = data.expiresAt || Date.now() + 3000 * 1000;
         this.currentAccount = {
           id: data.user?.id,
-          name: data.user?.name || 'Microsoft 365 User',
-          username: data.user?.email || '',
+          name: data.user?.name || 'Roland Schroeder',
+          username: data.user?.email || 'rschroeder@protemp.co.za',
         };
         return this.currentAccount;
       }
@@ -57,63 +47,29 @@ class GraphService {
     return null;
   }
 
-  public async startDeviceCodeLogin(): Promise<DeviceCodeSession> {
+  public async login(): Promise<void> {
+    const origin =
+      typeof window !== 'undefined'
+        ? window.location.origin
+        : 'https://protemp-personal-assistant.vercel.app';
+
     const res = await fetch('/api/m365/auth', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action: 'start_device_code',
-        clientId: getStoredClientId(),
-        tenantId: getStoredTenantId(),
+        action: 'start_pkce_login',
+        origin,
       }),
     });
 
     const data = await res.json();
-    if (!res.ok || data.error) {
-      throw new Error(data.error || 'Could not start Microsoft 365 sign-in');
-    }
-    return data as DeviceCodeSession;
-  }
-
-  public async pollDeviceCodeLogin(deviceCode: string): Promise<{
-    status: 'pending' | 'connected' | 'error';
-    account?: M365AccountProfile;
-    error?: string;
-  }> {
-    const res = await fetch('/api/m365/auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'poll_device_code',
-        deviceCode,
-        clientId: getStoredClientId(),
-        tenantId: getStoredTenantId(),
-      }),
-    });
-
-    const data = await res.json();
-    if (data.status === 'pending') {
-      return { status: 'pending' };
-    }
-    if (!res.ok || data.status === 'error') {
-      return {
-        status: 'error',
-        error: data.error || 'Sign-in expired or failed',
-      };
+    if (!res.ok || !data.authorizeUrl) {
+      throw new Error(data.error || 'Could not start Microsoft 365 login');
     }
 
-    this.cachedAccessToken = data.accessToken;
-    this.tokenExpiresAt = data.expiresAt || Date.now() + 3500 * 1000;
-    this.currentAccount = {
-      id: data.user?.id,
-      name: data.user?.name || 'Microsoft 365 User',
-      username: data.user?.email || '',
-    };
-
-    return {
-      status: 'connected',
-      account: this.currentAccount,
-    };
+    if (typeof window !== 'undefined') {
+      window.location.href = data.authorizeUrl;
+    }
   }
 
   public async logout(): Promise<void> {
@@ -145,8 +101,8 @@ class GraphService {
     this.tokenExpiresAt = data.expiresAt || Date.now() + 3500 * 1000;
     this.currentAccount = {
       id: data.user?.id,
-      name: data.user?.name || 'Microsoft 365 User',
-      username: data.user?.email || '',
+      name: data.user?.name || 'Roland Schroeder',
+      username: data.user?.email || 'rschroeder@protemp.co.za',
     };
 
     return data.accessToken;
@@ -269,7 +225,6 @@ class GraphService {
     const client = await this.getGraphClient();
     const plansMap = new Map<string, PlannerPlan>();
 
-    // Strategy A: Direct /me/planner/plans
     try {
       const directRes = await client.api('/me/planner/plans').get();
       for (const p of directRes.value || []) {
@@ -279,7 +234,6 @@ class GraphService {
       // Fallback to Strategy B
     }
 
-    // Strategy B: Discover plans from user's existing Planner tasks (/me/planner/tasks only requires Tasks.ReadWrite!)
     try {
       const tasksRes = await client.api('/me/planner/tasks').top(50).get();
       const uniquePlanIds = Array.from(
@@ -446,7 +400,7 @@ class GraphService {
   }
 
   // ==========================================================
-  // 3. OUTLOOK EMAIL (GRAPH API + OUTLOOK WEB FALLBACK)
+  // 3. OUTLOOK EMAIL
   // ==========================================================
   public async sendOrDraftOutlookEmail(
     action: AssistantAction,

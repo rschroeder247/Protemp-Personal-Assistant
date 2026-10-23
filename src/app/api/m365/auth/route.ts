@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 
 const supabaseUrl =
   process.env.NEXT_PUBLIC_SUPABASE_URL ||
@@ -10,18 +11,12 @@ const supabaseAnonKey =
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// Microsoft Office First-Party Public Client ID
-// Unlike SPA app registrations (which fail on /token with AADSTS7000218 client_secret required),
-// this native Microsoft public client has allowPublicClient=true globally and never requires a client_secret.
-const NATIVE_PUBLIC_CLIENT_ID = 'd3590ed6-52b3-4102-aeff-aad2292ab01c';
+const SPA_CLIENT_ID = 'abae4ffc-842f-45cb-aea5-8394d2de9a82';
+const TENANT_ID = '70fc3e15-9b2c-4e05-8f43-9cebcc9bfada';
+const REGISTERED_SPA_ORIGIN = 'https://eisenhower-matrix-flow.vercel.app';
+const SCOPES = 'User.Read Calendars.ReadWrite Tasks.ReadWrite offline_access';
 
-const DEFAULT_TENANT_ID =
-  process.env.NEXT_PUBLIC_AZURE_TENANT_ID ||
-  '70fc3e15-9b2c-4e05-8f43-9cebcc9bfada';
-
-const SCOPES =
-  'https://graph.microsoft.com/User.Read https://graph.microsoft.com/Tasks.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.ReadWrite offline_access';
-
+const PKCE_SETTINGS_KEY = 'm365_pkce_verifier';
 const TOKEN_SETTINGS_KEY = 'm365_auth_tokens';
 
 interface StoredTokenData {
@@ -37,18 +32,12 @@ interface StoredTokenData {
   };
 }
 
-/**
- * Ensures we never use the SPA-only client ID ('abae4ffc-...') for Device Code Flow,
- * because SPA registrations throw AADSTS7000218 (client_secret required) on /token.
- */
-function resolvePublicClientId(requestedClientId?: string): string {
-  if (
-    !requestedClientId ||
-    requestedClientId === 'abae4ffc-842f-45cb-aea5-8394d2de9a82'
-  ) {
-    return NATIVE_PUBLIC_CLIENT_ID;
-  }
-  return requestedClientId;
+function base64UrlEncode(buf: Buffer): string {
+  return buf
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 
 async function getStoredTokens(): Promise<StoredTokenData | null> {
@@ -76,21 +65,22 @@ async function refreshAccessToken(
   stored: StoredTokenData
 ): Promise<StoredTokenData | null> {
   if (!stored.refreshToken) return null;
-  const tenantId = stored.tenantId || DEFAULT_TENANT_ID;
-  const clientId = resolvePublicClientId(stored.clientId);
 
   const params = new URLSearchParams({
-    client_id: clientId,
+    client_id: SPA_CLIENT_ID,
     grant_type: 'refresh_token',
     refresh_token: stored.refreshToken,
     scope: SCOPES,
   });
 
   const res = await fetch(
-    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`,
+    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: REGISTERED_SPA_ORIGIN,
+      },
       body: params.toString(),
       cache: 'no-store',
     }
@@ -103,7 +93,7 @@ async function refreshAccessToken(
   const data = await res.json();
   const updated: StoredTokenData = {
     ...stored,
-    clientId,
+    clientId: SPA_CLIENT_ID,
     accessToken: data.access_token,
     refreshToken: data.refresh_token || stored.refreshToken,
     expiresAt: Date.now() + (data.expires_in || 3599) * 1000,
@@ -152,15 +142,8 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const {
-      action,
-      deviceCode,
-      clientId,
-      tenantId = DEFAULT_TENANT_ID,
-    } = body;
-
-    const effectiveClientId = resolvePublicClientId(clientId);
-    const effectiveTenantId = tenantId || DEFAULT_TENANT_ID;
+    const { action, origin = 'https://protemp-personal-assistant.vercel.app' } =
+      body;
 
     if (action === 'logout') {
       await supabase
@@ -170,129 +153,39 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true });
     }
 
-    if (action === 'start_device_code') {
-      const params = new URLSearchParams({
-        client_id: effectiveClientId,
-        scope: SCOPES,
-      });
-
-      const res = await fetch(
-        `https://login.microsoftonline.com/${effectiveTenantId}/oauth2/v2.0/devicecode`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: params.toString(),
-          cache: 'no-store',
-        }
+    if (action === 'start_pkce_login') {
+      const codeVerifier = base64UrlEncode(crypto.randomBytes(32));
+      const codeChallenge = base64UrlEncode(
+        crypto.createHash('sha256').update(codeVerifier).digest()
       );
 
-      const data = await res.json();
-      if (!res.ok) {
-        return NextResponse.json(
-          {
-            error:
-              data.error_description ||
-              data.error ||
-              'Failed to start Microsoft 365 sign-in',
-          },
-          { status: 400 }
-        );
-      }
-
-      return NextResponse.json({
-        userCode: data.user_code,
-        deviceCode: data.device_code,
-        verificationUri:
-          data.verification_uri || 'https://login.microsoft.com/device',
-        expiresIn: data.expires_in || 900,
-        interval: data.interval || 5,
-        message: data.message,
-      });
-    }
-
-    if (action === 'poll_device_code') {
-      if (!deviceCode) {
-        return NextResponse.json(
-          { error: 'deviceCode is required' },
-          { status: 400 }
-        );
-      }
-
-      const params = new URLSearchParams({
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        client_id: effectiveClientId,
-        device_code: deviceCode,
+      await supabase.from('pa_settings').upsert({
+        key: PKCE_SETTINGS_KEY,
+        value: {
+          codeVerifier,
+          createdAt: Date.now(),
+        },
+        updated_at: new Date().toISOString(),
       });
 
-      const res = await fetch(
-        `https://login.microsoftonline.com/${effectiveTenantId}/oauth2/v2.0/token`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: params.toString(),
-          cache: 'no-store',
-        }
+      const encodedOrigin = Buffer.from(origin).toString('base64');
+      const state = `pa_bridge_${encodedOrigin}`;
+
+      const authUrl = new URL(
+        `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/authorize`
       );
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        if (
-          data.error === 'authorization_pending' ||
-          data.error === 'slow_down'
-        ) {
-          return NextResponse.json({ status: 'pending' });
-        }
-        return NextResponse.json(
-          {
-            status: 'error',
-            error:
-              data.error_description || data.error || 'Authentication failed',
-          },
-          { status: 400 }
-        );
-      }
-
-      // Fetch user profile from Microsoft Graph
-      let user = {
-        id: '',
-        name: 'Roland Schroeder',
-        email: 'rschroeder@protemp.co.za',
-      };
-
-      try {
-        const meRes = await fetch('https://graph.microsoft.com/v1.0/me', {
-          headers: { Authorization: `Bearer ${data.access_token}` },
-          cache: 'no-store',
-        });
-        if (meRes.ok) {
-          const me = await meRes.json();
-          user = {
-            id: me.id || '',
-            name: me.displayName || me.userPrincipalName || 'Roland Schroeder',
-            email: me.mail || me.userPrincipalName || 'rschroeder@protemp.co.za',
-          };
-        }
-      } catch {
-        // ignore
-      }
-
-      const tokenPayload: StoredTokenData = {
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token || '',
-        expiresAt: Date.now() + (data.expires_in || 3599) * 1000,
-        clientId: effectiveClientId,
-        tenantId: effectiveTenantId,
-        user,
-      };
-
-      await saveStoredTokens(tokenPayload);
+      authUrl.searchParams.set('client_id', SPA_CLIENT_ID);
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('redirect_uri', REGISTERED_SPA_ORIGIN);
+      authUrl.searchParams.set('response_mode', 'query');
+      authUrl.searchParams.set('scope', SCOPES);
+      authUrl.searchParams.set('state', state);
+      authUrl.searchParams.set('code_challenge', codeChallenge);
+      authUrl.searchParams.set('code_challenge_method', 'S256');
+      authUrl.searchParams.set('prompt', 'select_account');
 
       return NextResponse.json({
-        status: 'connected',
-        accessToken: tokenPayload.accessToken,
-        expiresAt: tokenPayload.expiresAt,
-        user: tokenPayload.user,
+        authorizeUrl: authUrl.toString(),
       });
     }
 
