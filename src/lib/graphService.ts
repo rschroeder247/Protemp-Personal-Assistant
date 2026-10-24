@@ -138,13 +138,13 @@ class GraphService {
 
     let targetListId = defaultListId;
     if (!targetListId) {
-      const listsRes = await client
-        .api('/me/todo/lists')
-        .filter("wellknownListName eq 'defaultList'")
-        .get();
-      targetListId =
-        listsRes.value?.[0]?.id ||
-        (await client.api('/me/todo/lists').top(1).get()).value?.[0]?.id;
+      const listsRes = await client.api('/me/todo/lists').get();
+      const lists: any[] = listsRes.value || [];
+      const preferred =
+        lists.find((l) => l.wellknownListName === 'defaultList') ||
+        lists.find((l) => l.displayName?.toLowerCase() === 'tasks') ||
+        lists[0];
+      targetListId = preferred?.id;
     }
 
     if (!targetListId) {
@@ -191,12 +191,24 @@ class GraphService {
     await Promise.all(
       lists.slice(0, 5).map(async (list: any) => {
         try {
-          const tRes = await client
-            .api(`/me/todo/lists/${list.id}/tasks`)
-            .filter("status ne 'completed'")
-            .top(25)
-            .get();
-          for (const t of tRes.value || []) {
+          let tasks: any[] = [];
+          try {
+            const tRes = await client
+              .api(`/me/todo/lists/${list.id}/tasks`)
+              .filter("status ne 'completed'")
+              .top(25)
+              .get();
+            tasks = tRes.value || [];
+          } catch {
+            const fallbackRes = await client
+              .api(`/me/todo/lists/${list.id}/tasks`)
+              .top(50)
+              .get();
+            tasks = (fallbackRes.value || []).filter(
+              (t: any) => t.status !== 'completed'
+            );
+          }
+          for (const t of tasks) {
             results.push({
               ...t,
               listId: list.id,
